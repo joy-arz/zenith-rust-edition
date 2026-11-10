@@ -8,13 +8,17 @@ on:
         required: true
         default: 0.2.0-preview.1
       source_commit:
-        description: Optional exact commit SHA for an artifact-only rebuild
+        description: Exact commit SHA for an artifact-only rebuild or a draft promotion
         type: string
         default: ''
       publish_preview:
-        description: Publish the verified archives as a private GitHub prerelease
+        description: Sign and publish verified archives from the public engine repository
         type: boolean
         default: false
+      draft_checksums_sha256:
+        description: SHA-256 of SHA256SUMS in an existing draft release, to promote without a rebuild
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -28,7 +32,9 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'joy-arz/zenith-rust-edition' || github.repository == 'joy-arz/Zenith'
+    if: >-
+      !inputs.draft_checksums_sha256
+      && (github.repository == 'joy-arz/zenith-rust-edition' || github.repository == 'joy-arz/Zenith')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     strategy:
@@ -161,46 +167,94 @@ jobs:
   publish:
     environment: zenith-engine-release
     if: >-
-      inputs.publish_preview && !inputs.source_commit && github.repository == 'joy-arz/zenith-rust-edition'
-      && github.event.repository.private && github.ref == 'refs/heads/main'
+      !cancelled() && inputs.publish_preview && github.repository == 'joy-arz/zenith-rust-edition'
+      && !github.event.repository.private && github.ref == 'refs/heads/main'
+      && ((needs.verify.result == 'success' && !inputs.source_commit)
+          || (needs.verify.result == 'skipped' && inputs.source_commit && inputs.draft_checksums_sha256))
     needs: verify
+    concurrency: zenith-publish-${{ inputs.version }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v8
+        if: '!inputs.draft_checksums_sha256'
         with:
           pattern: zenith-*
           path: dist
           merge-multiple: true
-      - name: Sign the verified checksums for Zenith Launcher
-        env:
-          ZENITH_ENGINE_SIGNING_KEY: ${{ secrets.ZENITH_ENGINE_SIGNING_KEY }}
-        run: |
-          (cd dist && sha256sum --check SHA256SUMS)
-          bash tools/ci/sign_zenith_checksums.sh "zenith-game@$HORIZON_VERSION" dist launcher/zenith-engine-release-keys.txt
-      - name: Publish the verified preview
+      - name: Download the staged preview
+        if: inputs.draft_checksums_sha256
         env:
           GH_TOKEN: ${{ github.token }}
+          DRAFT_SUMS_SHA256: ${{ inputs.draft_checksums_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$HORIZON_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-preview\.[1-9][0-9]*$ ]]
+          [[ "$ZENITH_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$DRAFT_SUMS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          tag="zenith-game@$HORIZON_VERSION"
+          git merge-base --is-ancestor "$ZENITH_SOURCE_COMMIT" HEAD
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish |
+            jq -e --arg commit "$ZENITH_SOURCE_COMMIT" '.isDraft and .targetCommitish == $commit'
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern 'zenith-*.tar.gz' --pattern preview.json --pattern SHA256SUMS \
+            --pattern SHA256SUMS.sig --pattern ephemeral.pub
+          printf '%s  %s\n' "$DRAFT_SUMS_SHA256" dist/SHA256SUMS | sha256sum --strict --check
+      - name: Verify the preview before using the release key
         shell: bash
         run: |
           set -euo pipefail
           tag="zenith-game@$HORIZON_VERSION"
-          jq -e --arg tag "$tag" --arg commit "$GITHUB_SHA" \
-            '.tag == $tag and .source_commit == $commit and .channel == "preview"' dist/preview.json
-          (cd dist && sha256sum --check SHA256SUMS)
+          jq -e --arg tag "$tag" --arg commit "$ZENITH_SOURCE_COMMIT" --arg version "$HORIZON_VERSION" \
+            '.tag == $tag and .source_commit == $commit and .version == $version and .channel == "preview"' dist/preview.json
+          # Require the same payload set in both paths, independent of the uploaded filenames.
+          diff -u <(printf '%s\n' preview.json zenith-{linux-x86_64,macos-arm64,macos-x64,server-linux-x86_64,source,windows-arm64,windows-x64}.tar.gz | sort) \
+            <(sed -nE 's/^[0-9a-f]{64}  ([a-z0-9._-]+)$/\1/p' dist/SHA256SUMS | sort)
+          [[ "$(wc -l < dist/SHA256SUMS)" -eq 8 ]]
+          (cd dist && sha256sum --strict --check SHA256SUMS)
+          cargo run --locked --quiet -p horizon-release-sign -- verify \
+            --tag "$tag" --key "$(cat dist/ephemeral.pub)" dist
+      - name: Sign the verified checksums for Zenith Launcher
+        env:
+          ZENITH_ENGINE_SIGNING_KEY: ${{ secrets.ZENITH_ENGINE_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/ci/sign_zenith_checksums.sh "zenith-game@$HORIZON_VERSION" dist launcher/zenith-engine-release-keys.txt
+      - name: Publish the signed preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_SUMS_SHA256: ${{ inputs.draft_checksums_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="zenith-game@$HORIZON_VERSION"
+          cargo run --locked --quiet -p horizon-release-sign -- verify --tag "$tag" \
+            --signature SHA256SUMS.zenith.sig --key "$(cat launcher/zenith-engine-release-keys.txt)" dist
           api="repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag"
           ref=$(gh api "$api" --jq '.[] | select(.ref == "refs/tags/'"$tag"'") | .object.sha')
           if [[ -z "$ref" ]]; then
             gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA" --silent
+              -f "ref=refs/tags/$tag" -f "sha=$ZENITH_SOURCE_COMMIT" --silent
           else
-            [[ "$ref" == "$GITHUB_SHA" ]]
+            [[ "$ref" == "$ZENITH_SOURCE_COMMIT" ]]
           fi
-          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
-            --title "Zenith Rust Edition $HORIZON_VERSION" --notes-file packaging/ZENITH-PREVIEW.txt \
-            dist/*.tar.gz dist/preview.json dist/SHA256SUMS dist/SHA256SUMS.sig dist/SHA256SUMS.zenith.sig dist/ephemeral.pub
+          if [[ -n "$DRAFT_SUMS_SHA256" ]]; then
+            gh release upload "$tag" dist/SHA256SUMS.zenith.sig --repo "$GITHUB_REPOSITORY" --clobber
+            release_id=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)
+            diff -u <((cd dist && sha256sum -- *) | awk '{print $2, "sha256:" $1}' | sort) \
+              <(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq '.assets[] | [.name, .digest] | join(" ")' | sort)
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --prerelease --latest=false --title "Zenith Rust Edition $HORIZON_VERSION" \
+              --notes-file packaging/ZENITH-PREVIEW.txt dist/*.tar.gz dist/preview.json \
+              dist/SHA256SUMS dist/SHA256SUMS.sig dist/SHA256SUMS.zenith.sig dist/ephemeral.pub
+          fi
