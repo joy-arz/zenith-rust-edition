@@ -84,12 +84,16 @@ remain available for rollback.
 
 From a terminal, `horizon-launcher install latest` installs Zenith;
 `horizon-launcher install horizon-latest` selects the Horizon compatibility
-channel. Maintainers with access to the private engine repository can still
-use `horizon-launcher zenith-access` for earlier private previews.
+channel.
 
-Maintainers can run the engine preview workflow on the public Zenith
-repository when the private runners are unavailable. Dispatch it with
-`publish_preview=false` and the reviewed engine commit. Once all five build
-jobs and verification pass, run `tools/ci/promote_zenith_preview.sh` with
-the run ID, commit, and preview version. The promotion verifies the
-archives and uses the launcher channel's signing key locally.
+The engine preview workflow signs releases from `main` in the public
+[engine repository](https://github.com/joy-arz/zenith-rust-edition) when
+`publish_preview=true`. The signing key is scoped to the
+`zenith-engine-release` environment.
+
+To reuse a verified build from the public Zenith repo, tag its exact source
+commit in the engine repo and upload the verified assets to a draft release
+at that tag. Dispatch the signing workflow with `publish_preview=true`,
+the exact `source_commit`, and the SHA-256 of the verified `SHA256SUMS` as
+`draft_checksums_sha256`. Copy the signed release to the public Zenith
+release catalog so existing launchers can install it.
